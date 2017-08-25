@@ -60,6 +60,7 @@ namespace ErrorCodes
 {
     extern const int MEMORY_LIMIT_EXCEEDED;
     extern const int SYNTAX_ERROR;
+    extern const int CORRUPTED_DATA;
 }
 
 
@@ -129,6 +130,25 @@ MergeTreeData::MergeTreeData(
     /// Creating directories, if not exist.
     Poco::File(full_path).createDirectories();
     Poco::File(full_path + "detached").createDirectory();
+
+    String version_file_path = full_path + "format_version.txt";
+    if (!attach)
+    {
+        format_version = MergeTreeDataFormatVersion::V1;
+        WriteBufferFromFile buf(version_file_path);
+        writeIntText(static_cast<int>(format_version), buf);
+    }
+    else if (Poco::File(version_file_path).exists())
+    {
+        ReadBufferFromFile buf(version_file_path);
+        int version;
+        readIntText(version, buf);
+        if (version < 0 || version > 1 || !buf.eof())
+            throw Exception("Bad version file: " + version_file_path, ErrorCodes::CORRUPTED_DATA);
+        format_version = static_cast<MergeTreeDataFormatVersion>(version);
+    }
+    else
+        format_version = MergeTreeDataFormatVersion::V0;
 }
 
 
@@ -366,7 +386,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
     for (const String & file_name : part_file_names)
     {
         MergeTreePartInfo part_info;
-        if (!MergeTreePartInfo::tryParsePartName(file_name, &part_info))
+        if (!MergeTreePartInfo::tryParsePartName(file_name, &part_info, format_version))
             continue;
 
         MutableDataPartPtr part = std::make_shared<DataPart>(*this, file_name, part_info);
@@ -418,7 +438,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
                         continue;
 
                     MergeTreePartInfo contained_part_info;
-                    if (!MergeTreePartInfo::tryParsePartName(contained_name, &contained_part_info))
+                    if (!MergeTreePartInfo::tryParsePartName(contained_name, &contained_part_info, format_version))
                         continue;
 
                     if (part->info.contains(contained_part_info))
@@ -1252,8 +1272,11 @@ MergeTreeData::DataPartsVector MergeTreeData::renameTempPartAndReplace(
         if (increment)
             part->info.min_block = part->info.max_block = increment->get();
 
-        String new_name = MergeTreePartInfo::getPartName(
-                part->getMinDate(), part->getMaxDate(), part->info.min_block, part->info.max_block, part->info.level);
+        String new_name;
+        if (format_version == MergeTreeDataFormatVersion::V0)
+            new_name = part->info.getPartNameV0(part->getMinDate(), part->getMaxDate());
+        else
+            new_name = part->info.getPartName();
 
         LOG_TRACE(log, "Renaming temporary part " << part->relative_path << " to " << new_name << ".");
 
@@ -1529,7 +1552,7 @@ void MergeTreeData::delayInsertIfNeeded(Poco::Event * until)
 
 MergeTreeData::DataPartPtr MergeTreeData::getActiveContainingPart(const String & part_name)
 {
-    auto part_info = MergeTreePartInfo::fromPartName(part_name);
+    auto part_info = MergeTreePartInfo::fromPartName(part_name, format_version);
 
     std::lock_guard<std::mutex> lock(data_parts_mutex);
 
@@ -1556,7 +1579,7 @@ MergeTreeData::DataPartPtr MergeTreeData::getActiveContainingPart(const String &
 
 MergeTreeData::DataPartPtr MergeTreeData::getPartIfExists(const String & part_name)
 {
-    auto part_info = MergeTreePartInfo::fromPartName(part_name);
+    auto part_info = MergeTreePartInfo::fromPartName(part_name, format_version);
 
     std::lock_guard<std::mutex> lock(all_data_parts_mutex);
     auto it = all_data_parts.lower_bound(part_info);
@@ -1724,7 +1747,7 @@ size_t MergeTreeData::getPartitionSize(const std::string & partition_id) const
     for (Poco::DirectoryIterator it(full_path); it != end; ++it)
     {
         MergeTreePartInfo part_info;
-        if (!MergeTreePartInfo::tryParsePartName(it.name(), &part_info))
+        if (!MergeTreePartInfo::tryParsePartName(it.name(), &part_info, format_version))
             continue;
         if (part_info.partition_id != partition_id)
             continue;
